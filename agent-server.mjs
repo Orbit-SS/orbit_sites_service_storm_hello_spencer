@@ -9,6 +9,23 @@ import "dotenv/config";
 
 const PORT = 4000;
 
+// If SANDBOX_BRANCH is set, the agent must stay on that branch.
+// When absent (internal use), any branch is allowed.
+const ALLOWED_BRANCH = process.env.SANDBOX_BRANCH || null;
+
+// Authoritative branch checkout — runs before anything else.
+// The sandbox setup already tries this, but can race against git fetch.
+// Doing it here guarantees we're on the right branch before the first message.
+if (ALLOWED_BRANCH) {
+  try {
+    execSync(`git fetch origin ${ALLOWED_BRANCH}`, { cwd: "/vercel/sandbox", stdio: "pipe" });
+    execSync(`git checkout ${ALLOWED_BRANCH}`, { cwd: "/vercel/sandbox", stdio: "pipe" });
+    console.log(`[agent-server] On branch: ${ALLOWED_BRANCH}`);
+  } catch (e) {
+    console.error(`[agent-server] Failed to checkout '${ALLOWED_BRANCH}':`, e.message);
+  }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -19,8 +36,8 @@ const messages = [];
 // One session per sandbox lifetime (persists conversation across messages)
 const session = unstable_v2_createSession({
   model: "claude-sonnet-4-6",
-  permissionMode: "acceptEdits",
-  allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
+  permissionMode: "auto",
+  allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep", "WebFetch"],
 });
 
 function sendSSE(res, data) {
@@ -31,6 +48,8 @@ app.get("/messages", (_req, res) => {
   res.json(messages);
 });
 
+
+
 app.post("/message", async (req, res) => {
   const { message } = req.body;
 
@@ -40,6 +59,9 @@ app.post("/message", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+
+  // Keep connection alive during long operations (proxies kill idle SSE streams)
+  const heartbeat = setInterval(() => res.write(": ping\n\n"), 15000);
 
   let assistantText = "";
 
@@ -79,10 +101,20 @@ app.post("/message", async (req, res) => {
           // Auto-commit and push on success
           if (msg.subtype === "success") {
             try {
-              execSync("git add -A", { cwd: "/vercel/sandbox" });
-              execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: "/vercel/sandbox" });
-              execSync("git push", { cwd: "/vercel/sandbox" });
-              sendSSE(res, { type: "saved" });
+              // Branch protection: only push to the allowed branch
+              const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: "/vercel/sandbox" })
+                .toString()
+                .trim();
+
+              if (ALLOWED_BRANCH && currentBranch !== ALLOWED_BRANCH) {
+                // Silently skip — do not push to an unintended branch
+                console.warn(`[agent-server] Skipping push: on '${currentBranch}', expected '${ALLOWED_BRANCH}'`);
+              } else {
+                execSync("git add -A", { cwd: "/vercel/sandbox" });
+                execSync(`git commit -m "${message.replace(/"/g, '\\"').replace(/`/g, "\\`").replace(/\$/g, "\\$")}"`, { cwd: "/vercel/sandbox" });
+                execSync("git push", { cwd: "/vercel/sandbox" });
+                sendSSE(res, { type: "saved" });
+              }
             } catch (e) {
               // No changes to commit is fine
             }
@@ -99,8 +131,10 @@ app.post("/message", async (req, res) => {
   } catch (err) {
     sendSSE(res, { type: "error", message: err.message });
   } finally {
+    clearInterval(heartbeat);
     res.end();
   }
 });
+
 
 app.listen(PORT, () => console.log(`Agent server on :${PORT}`));
